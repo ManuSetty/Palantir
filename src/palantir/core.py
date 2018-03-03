@@ -534,7 +534,7 @@ def _differentiation_entropy(wp_data, terminal_states, knn, n_jobs, trajectory):
     # with high probability
     for s in abs_states:
         _, nb, _ = find(T[s, :] > 0)
-        T[nb, s] = 1
+        T[nb, s] = 0.5
 
 
     # Absorption probabilities
