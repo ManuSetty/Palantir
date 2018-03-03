@@ -49,7 +49,6 @@ def run_diffusion_maps(pca_projections, n_components=10, knn=30, n_jobs=-1):
     x, y, dists = find(kNN)
 
     # X, y specific stds
-    sigmas = (adaptive_std[x] ** 2 + adaptive_std[y] ** 2) / 2
     dists = dists/adaptive_std[x]
     W = csr_matrix((np.exp(-dists), (x, y)), shape=[N, N])
 

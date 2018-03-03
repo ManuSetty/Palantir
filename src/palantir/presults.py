@@ -22,7 +22,7 @@ class PResults(object):
             (trajectory.max() - trajectory.min())
         self._entropy = entropy
         self._branch_probs = branch_probs
-        self._branch_probs[self._branch_probs < 0.01] = 0
+        # self._branch_probs[self._branch_probs < 0.01] = 0
         self._waypoints = waypoints
 
     # Getters and setters
@@ -41,10 +41,6 @@ class PResults(object):
     @property
     def entropy(self):
         return self._entropy
-
-    @entropy.setter
-    def entropy(self, entropy):
-        self._entropy = entropy
 
     @property
     def waypoints(self):

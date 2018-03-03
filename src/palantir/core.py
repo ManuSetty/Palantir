@@ -14,7 +14,7 @@ from sklearn.neighbors import NearestNeighbors
 from joblib import Parallel, delayed
 from scipy.sparse.linalg import eigs
 
-from scipy.sparse import csr_matrix, find
+from scipy.sparse import csr_matrix, find, csgraph
 from scipy.stats import entropy, pearsonr, norm
 from scipy.cluster import hierarchy
 from numpy.linalg import inv
@@ -30,7 +30,7 @@ warnings.filterwarnings(action="ignore", module="scipy",
 def run_palantir(ms_data, early_cell, terminal_states=None,
                  knn=30, num_waypoints=1200, n_jobs=-1,
                  scale_components=True, use_early_cell_as_start=False):
-    """Function for max min sampling of waypoints
+    """Palantir to identify trajectory and entropy in a differentiation system
 
     :param data: Multiscale space diffusion components
     :param early_cell: Start cell for trajectory construction
@@ -98,6 +98,92 @@ def run_palantir(ms_data, early_cell, terminal_states=None,
     return res
 
 
+def fate_prediction(data, labels, knn=30, n_jobs=-1):
+    """Palantir fate prediction mode
+
+    :param data: Multiscale space diffusion components
+    :param labels: Pandas series object representing the training set
+    :param knn: Number of nearest neighbors for graph construction
+    :param num_jobs: Number of jobs for parallel processing
+    :return: Probabilities representing fate prediction and entropy
+    """
+
+    # kNN graph
+    print('Computing the transition matrix...')
+    W = _compute_affinity_matrix(data, knn, n_jobs)
+    T = _normalize_transition_matrix(W)
+
+    # All GFP +/- cells are absorption states
+    abs_states = np.where(data.index.isin(labels.index))[0]
+    probs = _compute_absorption_probabilities(T, abs_states)
+
+    # Dataframe of probabilities
+    trans_states = list(set(range(T.shape[0])).difference(abs_states))
+    probs = pd.DataFrame(probs, index=data.index[trans_states],
+                         columns=data.index[abs_states])
+    
+    # Summarize probabilities
+    probs = probs.groupby(labels[probs.columns].values, axis=1).sum(axis=1)
+
+    # Add labels
+    df = pd.DataFrame(0.0, index=labels.index, columns=probs.columns)
+    for ct in set(labels):
+        df.loc[labels.index[labels == ct], ct] = 1
+    probs = probs.append(df).loc[data.index, :]
+
+    # Entropy
+    ent = probs.apply(entropy, axis=1)
+
+    return probs, ent
+
+
+def identify_terminal_states(ms_data, early_cell, knn=30, num_waypoints=1200, n_jobs=-1):
+    """Function to identify terminal states in the data
+
+    :param ms_data: Multiscale space diffusion components
+    :param early_cell: Start cell for trajectory construction
+    :param knn: Number of nearest neighbors for graph construction
+    :param num_waypoints: Number of waypoints to sample
+    :param num_jobs: Number of jobs for parallel processing
+    :return: Terminal states
+    """
+
+
+    # Scale components
+    data = pd.DataFrame(preprocessing.minmax_scale(ms_data),
+                        index=ms_data.index, columns=ms_data.columns)
+
+    #  Start cell as the nearest diffusion map boundary
+    dm_boundaries = pd.Index(set(data.idxmax()).union(data.idxmin()))
+    dists = pairwise_distances(data.loc[dm_boundaries, :],
+                               data.loc[early_cell, :].values.reshape(1, -1))
+    start_cell = pd.Series(np.ravel(dists), index=dm_boundaries).idxmin()
+
+    # Sample waypoints
+    # Append start cell
+    waypoints = _max_min_sampling(data, num_waypoints)
+    waypoints = waypoints.union(dm_boundaries)
+    waypoints = pd.Index(waypoints.difference([start_cell]).unique())
+
+    # Append start cell
+    waypoints = pd.Index([start_cell]).append(waypoints)
+
+    # Distance to start cell as pseudo trajectory
+    trajectory, _ = _compute_trajectory(data, start_cell, knn,
+                                        waypoints, n_jobs)
+
+    # Markov chain
+    wp_data = data.loc[waypoints, :]
+    T = _construct_phenotypic_markov_chain(wp_data, knn, trajectory[waypoints], n_jobs)
+
+    # Terminal states
+    terminal_states = _terminal_states_from_markov_chain(
+        T, wp_data, trajectory)
+
+    # Excluded diffusion map boundaries
+    return terminal_states
+
+
 def _max_min_sampling(data, num_waypoints):
     """Function for max min sampling of waypoints
 
@@ -143,8 +229,7 @@ def _max_min_sampling(data, num_waypoints):
     return waypoints
 
 
-def _compute_trajectory(data, start_cell, knn,
-                        waypoints, n_jobs, max_iterations=25):
+def _compute_trajectory(data, start_cell, knn, waypoints, n_jobs, max_iterations=25):
     """Function for compute the trajectory
 
     :param data: Multiscale space diffusion components
@@ -226,96 +311,145 @@ def _compute_trajectory(data, start_cell, knn,
     return trajectory, W
 
 
-def identify_terminal_states(ms_data, early_cell, knn=30, num_waypoints=1200, n_jobs=-1):
-
-    # Scale components
-    data = pd.DataFrame(preprocessing.minmax_scale(ms_data),
-                        index=ms_data.index, columns=ms_data.columns)
-
-    #  Start cell as the nearest diffusion map boundary
-    dm_boundaries = pd.Index(set(data.idxmax()).union(data.idxmin()))
-    dists = pairwise_distances(data.loc[dm_boundaries, :],
-                               data.loc[early_cell, :].values.reshape(1, -1))
-    start_cell = pd.Series(np.ravel(dists), index=dm_boundaries).idxmin()
-
-    # Sample waypoints
-    # Append start cell
-    waypoints = _max_min_sampling(data, num_waypoints)
-    waypoints = waypoints.union(dm_boundaries)
-    waypoints = pd.Index(waypoints.difference([start_cell]).unique())
-
-    # Append start cell
-    waypoints = pd.Index([start_cell]).append(waypoints)
-
-    # Distance to start cell as pseudo trajectory
-    trajectory, _ = _compute_trajectory(data, start_cell, knn,
-                                        waypoints, n_jobs)
-
-    # Markov chain
-    wp_data = data.loc[waypoints, :]
-    T = _construct_markov_chain(wp_data, knn, trajectory, n_jobs)
-
-    # Terminal states
-    terminal_states = _terminal_states_from_markov_chain(
-        T, wp_data, trajectory)
-
-    # Excluded diffusion map boundaries
-    dm_boundaries = pd.Index(set(wp_data.idxmax()).union(wp_data.idxmin()))
-    excluded_boundaries = dm_boundaries.difference(
-        terminal_states).difference([start_cell])
-    return terminal_states, excluded_boundaries
-
-
-def _construct_markov_chain(wp_data, knn, trajectory, n_jobs):
-
-    # Markov chain construction
-    print('Markov chain construction...')
-    waypoints = wp_data.index
+def _compute_affinity_matrix(data, knn, n_jobs):
+    """Function to compute the affinity matrix using k-adaptive kernel
+    """
 
     # kNN graph
     n_neighbors = knn
     nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean',
-                            n_jobs=n_jobs).fit(wp_data)
-    kNN = nbrs.kneighbors_graph(wp_data, mode='distance')
-    dist, ind = nbrs.kneighbors(wp_data)
+                            n_jobs=n_jobs).fit(data)
+    kNN = nbrs.kneighbors_graph(data, mode='distance')
+    dist, ind = nbrs.kneighbors(data)
 
     # Standard deviation allowing for "back" edges
-    adpative_k = np.min([int(np.floor(n_neighbors / 3)) - 1, 30])
+    # adpative_k = np.min([int(np.floor(n_neighbors / 3)) - 1, 30])
+    adpative_k = int(np.floor(n_neighbors / 3))
     adaptive_std = np.ravel(dist[:, adpative_k])
-
-    # Directed graph construction
-    # Trajectory position of all the neighbors
-    traj_nbrs = pd.DataFrame(trajectory[np.ravel(waypoints[ind])].values.reshape(
-        [len(waypoints), n_neighbors]), index=waypoints)
-
-    # Remove edges that move backwards in trajectory except for edges that are within
-    # the computed standard deviation
-    rem_edges = traj_nbrs.apply(
-        lambda x: x < trajectory[traj_nbrs.index] - adaptive_std)
-    rem_edges = rem_edges.stack()[rem_edges.stack()]
-
-    # Determine the indices and update adjacency matrix
-    cell_mapping = pd.Series(range(len(waypoints)), index=waypoints)
-    x = list(cell_mapping[rem_edges.index.get_level_values(0)])
-    y = list(rem_edges.index.get_level_values(1))
-    # Update adjacecy matrix
-    kNN[x, ind[x, y]] = 0
 
     # Affinity matrix and markov chain
     x, y, z = find(kNN)
     aff = np.exp(-(z ** 2)/(adaptive_std[x] ** 2) * 0.5
                  - (z ** 2)/(adaptive_std[y] ** 2) * 0.5)
-    W = csr_matrix((aff, (x, y)), [len(waypoints), len(waypoints)])
+    W = csr_matrix((aff, (x, y)), [data.shape[0], data.shape[0]])
 
-    # Transition matrix
-    D = np.ravel(W.sum(axis=1))
-    x, y, z = find(W)
-    T = csr_matrix((z / D[x], (x, y)), [len(waypoints), len(waypoints)])
+    return W
 
+
+def _normalize_transition_matrix(M):
+    """Function to normlize the probability matrix to create a transition matrix
+    """
+    D = np.ravel(M.sum(axis=1))
+    x, y, z = find(M)
+    T = csr_matrix((z / D[x], (x, y)), [M.shape[0], M.shape[1]])
     return T
 
 
+def _construct_phenotypic_markov_chain(wp_data, knn, wp_trajectory, n_jobs):
+    """Construct the phenotypic markov chain ensuring forward probability > 
+        backward probability for each cell
+    """
+
+    # Markov chain construction
+    print('Markov chain construction...')
+    waypoints = wp_data.index
+    trajectory = wp_trajectory.values
+
+
+    # Transition matrix
+    W = _compute_affinity_matrix(wp_data, knn, n_jobs)
+    T = _normalize_transition_matrix(W)
+
+
+    # Prune backward edges to ensure forward probability > backward probability
+    x, y, w = find(T)
+    fwd_edges = np.where(trajectory[x] <= trajectory[y])[0]
+    retained_edges = np.array([x, y, w]).T[fwd_edges, :]
+
+    back_edges = np.where(trajectory[x] > trajectory[y])[0]
+    for wp in set(x[back_edges]):
+        # Test edges
+        test_edges = back_edges[ x[back_edges] == wp ]
+        # Sorted order
+        test_edges = test_edges[np.argsort(w[test_edges])]
+
+        # Prune until fwd probability is greater than backward probability
+        back_prob = np.sum(w[test_edges])
+
+        if back_prob == 1:
+            retain_edges = test_edges
+        else:
+            diff = back_prob - (1 - back_prob)
+            # Find index
+            retain_inds = np.where(np.cumsum(w[test_edges]) >= diff)[0]
+            if len(retain_inds) <= 1:
+                continue
+            # Update the retained edges
+            retain_edges = test_edges[retain_inds[1]:]
+
+        retained_edges = np.append(retained_edges,
+            np.array([x, y, w]).T[retain_edges], axis=0)
+
+    T = csr_matrix(( retained_edges[:, 2], 
+        ( np.int32(retained_edges[:, 0]), np.int32(retained_edges[:, 1]))), 
+            [len(waypoints), len(waypoints)])
+
+    # Transition matrix
+    T = _normalize_transition_matrix(T)
+    return T
+
+
+    # # Markov chain construction
+    # print('Markov chain construction...')
+    # waypoints = wp_data.index
+
+    # # kNN graph
+    # n_neighbors = knn
+    # nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean',
+    #                         n_jobs=n_jobs).fit(wp_data)
+    # kNN = nbrs.kneighbors_graph(wp_data, mode='distance')
+    # dist, ind = nbrs.kneighbors(wp_data)
+
+    # # Standard deviation allowing for "back" edges
+    # adpative_k = np.min([int(np.floor(n_neighbors / 3)) - 1, 30])
+    # adaptive_std = np.ravel(dist[:, adpative_k])
+
+    # # Directed graph construction
+    # # Trajectory position of all the neighbors
+    # traj_nbrs = pd.DataFrame(trajectory[np.ravel(waypoints[ind])].values.reshape(
+    #     [len(waypoints), n_neighbors]), index=waypoints)
+
+    # # Remove edges that move backwards in trajectory except for edges that are within
+    # # the computed standard deviation
+    # rem_edges = traj_nbrs.apply(
+    #     lambda x: x < trajectory[traj_nbrs.index] - adaptive_std)
+    # rem_edges = rem_edges.stack()[rem_edges.stack()]
+
+    # # Determine the indices and update adjacency matrix
+    # cell_mapping = pd.Series(range(len(waypoints)), index=waypoints)
+    # x = list(cell_mapping[rem_edges.index.get_level_values(0)])
+    # y = list(rem_edges.index.get_level_values(1))
+    # # Update adjacecy matrix
+    # kNN[x, ind[x, y]] = 0
+
+    # # Affinity matrix and markov chain
+    # x, y, z = find(kNN)
+    # aff = np.exp(-(z ** 2)/(adaptive_std[x] ** 2) * 0.5
+    #              - (z ** 2)/(adaptive_std[y] ** 2) * 0.5)
+    # W = csr_matrix((aff, (x, y)), [len(waypoints), len(waypoints)])
+
+    # # Transition matrix
+    # D = np.ravel(W.sum(axis=1))
+    # x, y, z = find(W)
+    # T = csr_matrix((z / D[x], (x, y)), [len(waypoints), len(waypoints)])
+
+    # return T
+
+
 def _terminal_states_from_markov_chain(T, wp_data, trajectory):
+    """Identify terminal states from the markov chain
+       
+    """
     print('Identification of terminal states...')
 
     # Identify terminal statses
@@ -346,8 +480,37 @@ def _terminal_states_from_markov_chain(T, wp_data, trajectory):
     return terminal_states
 
 
-def _differentiation_entropy(wp_data, terminal_states,
-                             knn, n_jobs, trajectory):
+def _compute_absorption_probabilities(T, abs_states):
+    """Function to compute the absorpotion probabilities
+    """
+
+    # Reset absorption state affinities by Removing neigbors
+    T[abs_states, :] = 0
+    # Diagnoals as 1s
+    T[abs_states, abs_states] = 1
+    T = _normalize_transition_matrix(T)
+
+
+    # Fundamental matrix and absorption probabilities
+    print('Computing fundamental matrix and absorption probabilities...')
+    # Transition states
+    N = T.shape[0]
+    trans_states = list(set(range(N)).difference(abs_states))
+
+    # Q matrix
+    Q = T[trans_states, :][:, trans_states]
+    # Fundamental matrix
+    mat = np.eye(Q.shape[0]) - Q.todense()
+    N = inv(mat)
+
+    # Absorption probabilities
+    probs = np.dot(N, T[trans_states, :][:, abs_states].todense())
+    probs[probs < 0] = 0
+
+    return probs
+
+
+def _differentiation_entropy(wp_data, terminal_states, knn, n_jobs, trajectory):
     """Function to compute entropy and branch probabilities
 
     :param wp_data: Multi scale data of the waypoints
@@ -358,7 +521,7 @@ def _differentiation_entropy(wp_data, terminal_states,
     :return: entropy and branch probabilities
     """
 
-    T = _construct_markov_chain(wp_data, knn, trajectory, n_jobs)
+    T = _construct_phenotypic_markov_chain(wp_data, knn, trajectory[wp_data.index], n_jobs)
 
     # Identify terminal states if not specified
     if terminal_states is None:
@@ -367,28 +530,19 @@ def _differentiation_entropy(wp_data, terminal_states,
     # Absorption states should not have outgoing edges
     waypoints = wp_data.index
     abs_states = np.where(waypoints.isin(terminal_states))[0]
-    # Reset absorption state affinities by Removing neigbors
-    T[abs_states, :] = 0
-    # Diagnoals as 1s
-    T[abs_states, abs_states] = 1
+    # Create sinks : neighbors of the terminal states will reach terminal states 
+    # with high probability
+    for s in abs_states:
+        _, nb, _ = find(T[s, :] > 0)
+        T[nb, s] = 0.5
 
-    # Fundamental matrix and absorption probabilities
-    print('Computing fundamental matrix and absorption probabilities...')
-    # Transition states
-    trans_states = list(set(range(len(waypoints))).difference(abs_states))
-
-    # Q matrix
-    Q = T[trans_states, :][:, trans_states]
-    # Fundamental matrix
-    mat = np.eye(Q.shape[0]) - Q.todense()
-    N = inv(mat)
 
     # Absorption probabilities
-    branch_probs = np.dot(N, T[trans_states, :][:, abs_states].todense())
+    branch_probs = _compute_absorption_probabilities(T, abs_states)
+    trans_states = list(set(range(T.shape[0])).difference(abs_states))
     branch_probs = pd.DataFrame(branch_probs,
                                 index=waypoints[trans_states],
                                 columns=waypoints[abs_states])
-    branch_probs[branch_probs < 0] = 0
 
     # Entropy
     ent = branch_probs.apply(entropy, axis=1)
@@ -404,16 +558,21 @@ def _differentiation_entropy(wp_data, terminal_states,
 
 def _shortest_path_helper(cell, adj):
     # NOTE: Graph construction is parallelized since constructing the graph outside was creating lock issues
-    graph = nx.Graph(adj)
-    return pd.Series(nx.single_source_dijkstra_path_length(graph, cell))
+    # graph = nx.Graph(adj)
+    # return pd.Series(nx.single_source_dijkstra_path_length(graph, cell))
+    return pd.Series(csgraph.dijkstra(adj, False, cell))
+
+    # Use scipy routines for speed up
 
 
 def _connect_graph(adj, data, start_cell):
+    """Function to ensure that the graph is connected
+    """
 
     # Create graph and compute distances
-    graph = nx.Graph(adj)
-    dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell)) 
-    dists = pd.Series(dists.values, index=data.index[dists.index])
+    dists = csgraph.dijkstra(adj, False, start_cell)
+    reacheable = np.where(~np.isinf(dists))[0]
+    dists = pd.Series(dists[reacheable], index=data.index[reacheable])
 
     # Idenfity unreachable nodes
     unreachable_nodes = data.index.difference(dists.index)
@@ -423,6 +582,7 @@ def _connect_graph(adj, data, start_cell):
 
     # Connect unreachable nodes
     while len(unreachable_nodes) > 0:
+
         farthest_reachable = np.where(data.index == dists.idxmax())[0][0]
 
         # Compute distances to unreachable nodes
@@ -435,13 +595,12 @@ def _connect_graph(adj, data, start_cell):
         adj[farthest_reachable, add_edge] = unreachable_dists.min()
 
         # Recompute distances to early cell
-        graph = nx.Graph(adj)
-        dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell)) 
-        dists = pd.Series(dists.values, index=data.index[dists.index])
+        dists = csgraph.dijkstra(adj, False, start_cell)
+        reacheable = np.where(~np.isinf(dists))[0]
+        dists = pd.Series(dists[reacheable], index=data.index[reacheable])
 
         # Idenfity unreachable nodes
         unreachable_nodes = data.index.difference(dists.index)
-
 
     return adj
 
