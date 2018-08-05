@@ -1,3 +1,6 @@
+Please refer to https://github.com/dpeerlab/Palantir for the most up to date version.
+------
+
 Palantir
 ------
 
